@@ -10,8 +10,9 @@
  * supabase-chat-reliability.js
  * app.js
  *
- * Does not bypass Supabase RLS.
- * Direct messages remain friend-only.
+ * Direct message permission is enforced by Supabase RLS.
+ * Client-side friendship pre-check is intentionally removed
+ * from sendMessage to prevent false blocking.
  */
 
 (function (global) {
@@ -78,57 +79,9 @@
     return Boolean(data);
   }
 
-  async function verifyDirectConversation(conversationId) {
-    const { client, user } = await getContext();
-
-    const { data: conversation, error } = await client
-      .from("conversations")
-      .select("id,type")
-      .eq("id", conversationId)
-      .maybeSingle();
-
-    if (error) throw error;
-
-    if (!conversation) {
-      throw new Error("कुराकानी भेटिएन वा तपाईं सदस्य हुनुहुन्न।");
-    }
-
-    if (conversation.type !== "direct") return true;
-
-    const { data: members, error: memberError } = await client
-      .from("conversation_members")
-      .select("user_id")
-      .eq("conversation_id", conversationId);
-
-    if (memberError) throw memberError;
-
-    const peer = (members || []).find(
-      item => item.user_id !== user.id
-    );
-
-    if (!peer) {
-      throw new Error("अर्को प्रयोगकर्ता भेटिएन।");
-    }
-
-    const friends = await hasFriendship(
-      client,
-      user.id,
-      peer.user_id
-    );
-
-    if (!friends) {
-      throw new Error(
-        "पहिले Friend Request स्वीकार हुनुपर्छ। " +
-        "साथी बनेपछि मात्र Message पठाउन मिल्छ।"
-      );
-    }
-
-    return true;
-  }
-
   /*
    * Direct Chat creation:
-   * Friendship is checked here and again by the database RPC.
+   * Only accepted friends can create a direct chat.
    */
   async function createDirectChat(friendId) {
     try {
@@ -167,14 +120,18 @@
   }
 
   /*
-   * Send:
-   * Client pre-check improves feedback.
-   * Database RLS remains the final authority.
+   * Send Message:
+   *
+   * IMPORTANT:
+   * Do not perform extra client-side conversation,
+   * member or friendship queries before sending.
+   *
+   * The original Supabase message service performs
+   * the INSERT. Supabase RLS remains the final authority
+   * and blocks messages when friendship is not accepted.
    */
   async function sendMessage(conversationId, content, options) {
     try {
-      await verifyDirectConversation(conversationId);
-
       const response = await original.sendMessage(
         conversationId,
         content,
@@ -184,8 +141,7 @@
       if (!response?.ok && isRlsError(response?.message)) {
         return failure(
           "MESSAGE_NOT_ALLOWED",
-          "Message पठाउन अनुमति भएन। " +
-          "Friendship र Chat सदस्यता जाँच गर्नुहोस्।"
+          "सन्देश पठाउन अनुमति भएन। पहिले साथी बनेको र Chat सदस्यता जाँच गर्नुहोस्।"
         );
       }
 
@@ -204,10 +160,8 @@
   /*
    * Load message history with actual read receipts.
    *
-   * App currently displays ✓✓ when message.receipts has
-   * at least one item. Therefore only READ receipts are
-   * placed in receipts. Delivery-only receipts are exposed
-   * separately as deliveryReceipts.
+   * Only READ receipts are exposed through receipts.
+   * Delivery-only receipts remain in deliveryReceipts.
    */
   async function getMessages(conversationId, options) {
     const response = await original.getMessages(
@@ -220,6 +174,7 @@
     }
 
     const messages = response.data;
+
     const ids = messages
       .map(message => message.id)
       .filter(Boolean);
@@ -273,8 +228,6 @@
 
   /*
    * Mark an incoming realtime message as delivered.
-   * The original service emits this event after receiving
-   * a Postgres Realtime INSERT.
    */
   async function handleIncomingMessage(event) {
     const detail = event.detail || {};
@@ -298,6 +251,7 @@
 
       if (!response?.ok) {
         deliveredMessages.delete(message.id);
+
         console.warn(
           "Message delivery receipt failed:",
           response?.message
@@ -306,7 +260,11 @@
 
     } catch (error) {
       deliveredMessages.delete(message.id);
-      console.warn("Incoming message delivery:", error);
+
+      console.warn(
+        "Incoming message delivery:",
+        error
+      );
     }
   }
 
@@ -316,8 +274,7 @@
   );
 
   /*
-   * Wrap the existing service without modifying its
-   * internal implementation or bypassing its security.
+   * Wrap the existing service.
    */
   global.KSKSupabaseMessages = new Proxy(original, {
     get(target, property) {
