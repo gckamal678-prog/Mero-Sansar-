@@ -44,6 +44,12 @@
     #waStartupFallback[hidden] {
       display: none;
     }
+
+    [data-ksk-cancel-request],
+    [data-ksk-open-notification] {
+      white-space: nowrap;
+      min-height: 34px;
+    }
   </style>
 
   <!-- Supabase services -->
@@ -54,13 +60,16 @@
   <script defer src="./supabase-posts.js"></script>
   <script defer src="./supabase-notifications.js"></script>
 
-  <!-- Chat reliability must load after messages and before app -->
+  <!-- Friend requests and notification navigation -->
+  <script defer src="./supabase-friend-request-ui.js"></script>
+
+  <!-- Chat reliability -->
   <script defer src="./supabase-chat-reliability.js"></script>
 
   <!-- Main application -->
   <script defer src="./app.js"></script>
 
-  <!-- Navigation controller must load after app.js -->
+  <!-- Navigation controller -->
   <script defer src="./app-navigation.js"></script>
 </head>
 
