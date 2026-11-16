@@ -1,22 +1,27 @@
-
 /* =========================================================
    KSK WHATSAPP — COMPLETE APPLICATION
    File: whatsapp/app.js
 
-   Supabase services:
-   - Auth
-   - Profile
-   - Friends
-   - Messages
-   - Posts
-   - Notifications
+   WhatsApp-style application powered by existing Supabase
+   services and database schema.
+
+   Includes:
+   - Authentication
+   - Chats and unread filtering
+   - Direct messages and groups
+   - Realtime messages, receipts and typing
+   - Message pagination, reply, edit and delete
+   - Chat preferences
+   - Group member management
+   - Contacts and friend requests
+   - Updates feed (posts table)
+   - Profile and notifications
+   - Search and media attachments
 
    Excluded:
    - Audio calls
    - Video calls
    - Voice recording
-
-   Database-backed features only.
    ========================================================= */
 
 (function (global) {
@@ -46,7 +51,9 @@
     messages: [],
 
     conversations: [],
+
     friends: {
+      userId: "",
       incoming: [],
       outgoing: [],
       friends: [],
@@ -62,19 +69,42 @@
     chatSearch: "",
     contactSearch: "",
     contactResults: [],
-
-    replyTo: null,
-    selectedFile: null,
     messageSearch: "",
 
+    replyTo: null,
+    loadingOlder: false,
+    hasOlderMessages: true,
+
+    typingUsers: new Set(),
+    presenceUsers: [],
+
+    realtime: {
+      messages: false,
+      notifications: false,
+      online: navigator.onLine
+    },
+
     requestVersion: 0,
-    toastTimer: null
+    chatRequestVersion: 0,
+
+    toastTimer: null,
+    typingTimer: null
   };
 
   let root = null;
   let startupPromise = null;
-  let eventListenersBound = false;
-  let realtimeListenersBound = false;
+  let eventsBound = false;
+  let realtimeEventsBound = false;
+
+  const PAGE_NAMES = [
+    "chats",
+    "updates",
+    "groups",
+    "contacts",
+    "profile",
+    "notifications",
+    "chat-detail"
+  ];
 
   /* =====================================================
      UTILITIES
@@ -85,7 +115,7 @@
 
     if (!api) {
       throw new Error(
-        "आवश्यक Supabase सेवा उपलब्ध छैन: " + name
+        "Supabase सेवा उपलब्ध छैन: " + name
       );
     }
 
@@ -121,12 +151,10 @@
   }
 
   function initials(name) {
-    const words = String(name || "W")
+    return String(name || "W")
       .trim()
       .split(/\s+/)
-      .filter(Boolean);
-
-    return words
+      .filter(Boolean)
       .slice(0, 2)
       .map(word => word.charAt(0))
       .join("")
@@ -153,21 +181,27 @@
 
     if (Number.isNaN(date.getTime())) return "";
 
+    const now = new Date();
+
+    if (date.toDateString() === now.toDateString()) {
+      return formatTime(value);
+    }
+
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+
+    if (date.toDateString() === yesterday.toDateString()) {
+      return "हिजो";
+    }
+
     return new Intl.DateTimeFormat("ne-IN", {
       day: "numeric",
       month: "short"
     }).format(date);
   }
 
-  function formatSize(bytes) {
-    const size = Number(bytes) || 0;
-
-    if (size < 1024) return size + " B";
-    if (size < 1024 * 1024) {
-      return (size / 1024).toFixed(1) + " KB";
-    }
-
-    return (size / (1024 * 1024)).toFixed(1) + " MB";
+  function currentUserId() {
+    return state.user?.id || "";
   }
 
   function resultData(response, fallback = []) {
@@ -182,22 +216,16 @@
     return response.data ?? fallback;
   }
 
-  function showToast(message, type = "info") {
-    const element = root?.querySelector("[data-wa-toast]");
+  function findConversation(id) {
+    return state.conversations.find(
+      item => String(item.id) === String(id)
+    );
+  }
 
-    if (!element) return;
-
-    element.textContent = String(message || "");
-    element.dataset.type = type;
-    element.hidden = !message;
-
-    if (state.toastTimer) {
-      global.clearTimeout(state.toastTimer);
-    }
-
-    state.toastTimer = global.setTimeout(() => {
-      element.hidden = true;
-    }, 3000);
+  function findMessage(id) {
+    return state.messages.find(
+      item => String(item.id) === String(id)
+    );
   }
 
   function avatarHTML(name, image, size = "") {
@@ -234,18 +262,46 @@
     `;
   }
 
-  function currentUserId() {
-    return state.user?.id || "";
+  function showToast(message, type = "info") {
+    const element = root?.querySelector("[data-wa-toast]");
+
+    if (!element) return;
+
+    element.textContent = String(message || "");
+    element.dataset.type = type;
+    element.hidden = !message;
+
+    if (state.toastTimer) {
+      global.clearTimeout(state.toastTimer);
+    }
+
+    state.toastTimer = global.setTimeout(() => {
+      element.hidden = true;
+    }, 3200);
   }
 
-  function findConversation(id) {
-    return state.conversations.find(
-      item => String(item.id) === String(id)
-    );
+  function setButtonLoading(button, loading, label) {
+    if (!button) return;
+
+    if (loading) {
+      button.dataset.originalText = button.textContent;
+      button.disabled = true;
+
+      if (label) button.textContent = label;
+    } else {
+      button.disabled = false;
+
+      if (button.dataset.originalText) {
+        button.textContent = button.dataset.originalText;
+        delete button.dataset.originalText;
+      }
+    }
   }
 
   function closeDialog() {
-    const element = root?.querySelector("[data-wa-dialog-root]");
+    const element = root?.querySelector(
+      "[data-wa-dialog-root]"
+    );
 
     if (element) element.innerHTML = "";
   }
@@ -289,8 +345,17 @@
     `;
   }
 
+  function showError(error, fallback = "काम पूरा हुन सकेन।") {
+    console.error(error);
+
+    showToast(
+      error?.message || fallback,
+      "error"
+    );
+  }
+
   /* =====================================================
-     ROOT AND APPLICATION SHELL
+     ROOT AND SHELL
   ===================================================== */
 
   function getRoot() {
@@ -329,13 +394,11 @@
           </div>
 
           <div class="wa-header-actions">
-
             <button
               class="wa-icon-button"
               type="button"
               data-wa-action="global-search"
               aria-label="खोज्नुहोस्"
-              title="खोज्नुहोस्"
             >⌕</button>
 
             <button
@@ -343,7 +406,6 @@
               type="button"
               data-wa-action="notifications"
               aria-label="सूचनाहरू"
-              title="सूचनाहरू"
             >
               ♧
               <span data-wa-notification-count hidden></span>
@@ -353,15 +415,12 @@
               class="wa-icon-button"
               type="button"
               data-wa-action="profile"
-              aria-label="सेटिङ"
-              title="सेटिङ"
+              aria-label="Settings"
             >⋮</button>
-
           </div>
         </header>
 
         <nav class="wa-tabs" aria-label="मुख्य पृष्ठ">
-
           <button
             class="wa-tab is-active"
             type="button"
@@ -385,13 +444,12 @@
           <button
             class="wa-tab"
             type="button"
-            data-wa-page="communities"
+            data-wa-page="groups"
             aria-selected="false"
           >
             <span class="wa-tab-icon">👥</span>
             Groups
           </button>
-
         </nav>
 
         <main class="wa-content" id="waMain">
@@ -409,7 +467,7 @@
 
           <section
             class="wa-page"
-            data-wa-page-content="communities"
+            data-wa-page-content="groups"
             hidden
           ></section>
 
@@ -464,7 +522,7 @@
             <button
               class="wa-nav-item"
               type="button"
-              data-wa-page="communities"
+              data-wa-page="groups"
             >
               <span class="wa-nav-icon">👥</span>
               <span>Groups</span>
@@ -505,8 +563,10 @@
   function renderAuthScreen(message = "") {
     root.innerHTML = `
       <div class="wa-shell">
-        <section class="wa-empty" style="min-height:100dvh">
-
+        <section
+          class="wa-empty"
+          style="min-height:100dvh;padding:24px"
+        >
           <div class="wa-empty-icon">💬</div>
 
           <h1 class="wa-page-title">WhatsApp</h1>
@@ -525,7 +585,6 @@
               text-align:left
             "
           >
-
             <label class="wa-section-title" for="waEmail">
               इमेल ठेगाना
             </label>
@@ -600,7 +659,6 @@
             >
               पासवर्ड बिर्सनुभयो?
             </button>
-
           </form>
         </section>
       </div>
@@ -628,7 +686,7 @@
 
     if (!email || !password) return;
 
-    button.disabled = true;
+    setButtonLoading(button, true, "प्रवेश गर्दै...");
     status.textContent = "प्रवेश गर्दै...";
 
     try {
@@ -647,7 +705,7 @@
       status.textContent =
         error?.message || "Login गर्न सकिएन।";
 
-      button.disabled = false;
+      setButtonLoading(button, false);
     }
   }
 
@@ -664,7 +722,7 @@
       const response = await service("auth")
         .signUp(email, password);
 
-      if (response.confirmationRequired) {
+      if (response?.confirmationRequired) {
         showToast(
           "इमेलमा आएको Confirmation Link खोल्नुहोस्।",
           "success"
@@ -675,10 +733,7 @@
       await startApplication();
 
     } catch (error) {
-      showToast(
-        error.message || "खाता बनाउन सकिएन।",
-        "error"
-      );
+      showError(error, "खाता बनाउन सकिएन।");
     }
   }
 
@@ -698,15 +753,12 @@
         "success"
       );
     } catch (error) {
-      showToast(
-        error.message || "अनुरोध पूरा भएन।",
-        "error"
-      );
+      showError(error, "अनुरोध पूरा भएन।");
     }
   }
 
   /* =====================================================
-     INITIAL DATA
+     DASHBOARD DATA
   ===================================================== */
 
   async function loadDashboard() {
@@ -732,11 +784,15 @@
       profile
     ] = jobs;
 
+    const failures = [];
+
     if (
       conversations.status === "fulfilled" &&
       conversations.value?.ok
     ) {
       state.conversations = conversations.value.data || [];
+    } else {
+      failures.push("Chats");
     }
 
     if (
@@ -744,6 +800,8 @@
       friends.value?.ok
     ) {
       state.friends = friends.value.data || state.friends;
+    } else {
+      failures.push("Contacts");
     }
 
     if (
@@ -751,6 +809,8 @@
       posts.value?.ok
     ) {
       state.posts = posts.value.data || [];
+    } else {
+      failures.push("Updates");
     }
 
     if (
@@ -758,14 +818,25 @@
       notifications.value?.ok
     ) {
       state.notifications = notifications.value.data || [];
+    } else {
+      failures.push("Notifications");
     }
 
     if (profile.status === "fulfilled") {
       state.profile = profile.value || null;
+    } else {
+      failures.push("Profile");
     }
 
     updateNotificationCount();
     renderCurrentPage();
+
+    if (failures.length) {
+      showToast(
+        "केही सेवा लोड भएनन्: " + failures.join(", "),
+        "error"
+      );
+    }
 
     return true;
   }
@@ -776,12 +847,15 @@
 
     state.conversations = resultData(response);
 
-    if (state.page === "chats") {
-      renderChats();
-    }
+    if (state.page === "chats") renderChats();
+    if (state.page === "groups") renderGroups();
 
-    if (state.page === "communities") {
-      renderCommunities();
+    if (state.activeChat) {
+      const updated = findConversation(state.activeChat.id);
+
+      if (updated) {
+        state.activeChat = updated;
+      }
     }
 
     return state.conversations;
@@ -793,9 +867,7 @@
 
     state.friends = resultData(response, state.friends);
 
-    if (state.page === "contacts") {
-      renderContacts();
-    }
+    if (state.page === "contacts") renderContacts();
 
     return state.friends;
   }
@@ -806,11 +878,24 @@
 
     state.posts = resultData(response);
 
-    if (state.page === "updates") {
-      renderUpdates();
-    }
+    if (state.page === "updates") renderUpdates();
 
     return state.posts;
+  }
+
+  async function refreshNotifications() {
+    const response = await service("notifications")
+      .getNotifications({ limit: 80 });
+
+    state.notifications = resultData(response);
+
+    updateNotificationCount();
+
+    if (state.page === "notifications") {
+      renderNotifications();
+    }
+
+    return state.notifications;
   }
 
   /* =====================================================
@@ -818,23 +903,18 @@
   ===================================================== */
 
   function navigate(page) {
-    const allowed = [
-      "chats",
-      "updates",
-      "communities",
-      "contacts",
-      "profile",
-      "notifications"
-    ];
+    if (!PAGE_NAMES.includes(page) || page === "chat-detail") {
+      return false;
+    }
 
-    if (!allowed.includes(page)) return false;
+    if (state.activeChat) {
+      service("messages").stopPresence?.();
+    }
 
     state.page = page;
     state.activeChat = null;
     state.messages = [];
     state.replyTo = null;
-
-    service("messages").stopPresence?.();
 
     root.querySelectorAll("[data-wa-page-content]")
       .forEach(section => {
@@ -884,8 +964,8 @@
         renderUpdates();
         break;
 
-      case "communities":
-        renderCommunities();
+      case "groups":
+        renderGroups();
         break;
 
       case "contacts":
@@ -906,6 +986,19 @@
      CHAT LIST
   ===================================================== */
 
+  function isUnread(conversation) {
+    const latest = conversation.lastMessage;
+
+    if (!latest || latest.senderId === currentUserId()) {
+      return false;
+    }
+
+    if (!conversation.lastReadAt) return true;
+
+    return new Date(latest.createdAt).getTime() >
+      new Date(conversation.lastReadAt).getTime();
+  }
+
   function renderChats() {
     const page = root.querySelector(
       '[data-wa-page-content="chats"]'
@@ -921,6 +1014,8 @@
       conversations = conversations.filter(
         item => item.type === "group"
       );
+    } else if (state.chatFilter === "unread") {
+      conversations = conversations.filter(isUnread);
     } else if (state.chatFilter === "pinned") {
       conversations = conversations.filter(
         item => item.isPinned
@@ -955,12 +1050,15 @@
         new Date(a.lastMessageAt || a.createdAt || 0);
     });
 
+    const unreadCount = state.conversations.filter(isUnread).length;
+
     page.innerHTML = `
       <div class="wa-page-heading">
         <div>
           <h2 class="wa-page-title">Chats</h2>
           <p class="wa-page-description">
-            तपाईंका निजी र समूह कुराकानी
+            ${state.conversations.length} कुराकानी
+            ${unreadCount ? ` · ${unreadCount} नपढिएका` : ""}
           </p>
         </div>
 
@@ -969,7 +1067,6 @@
           type="button"
           data-wa-action="new-chat"
           aria-label="नयाँ च्याट"
-          title="नयाँ च्याट"
         >＋</button>
       </div>
 
@@ -1004,7 +1101,9 @@
           conversations.length
             ? conversations.map(renderConversation).join("")
             : emptyState(
-                "कुराकानी भेटिएन",
+                state.chatFilter === "unread"
+                  ? "नपढिएको सन्देश छैन"
+                  : "कुराकानी भेटिएन",
                 "नयाँ च्याट सुरु गर्न + थिच्नुहोस्।",
                 "💬"
               )
@@ -1018,10 +1117,16 @@
 
     return `
       <button
-        class="wa-button ${active ? "wa-button-primary" : "wa-button-quiet"}"
+        class="wa-button ${
+          active ? "wa-button-primary" : "wa-button-quiet"
+        }"
         type="button"
         data-wa-chat-filter="${value}"
-        style="white-space:nowrap;min-height:34px;padding:6px 13px"
+        style="
+          white-space:nowrap;
+          min-height:34px;
+          padding:6px 13px
+        "
       >
         ${label}
       </button>
@@ -1045,14 +1150,10 @@
           : "📎 Attachment";
     }
 
-    const time = formatTime(item.lastMessageAt);
+    const unread = isUnread(item);
 
     return `
-      <div
-        class="wa-list-row"
-        style="cursor:pointer"
-        data-wa-conversation-row="${escapeHTML(item.id)}"
-      >
+      <div class="wa-list-row">
         <button
           type="button"
           data-wa-open-chat="${escapeHTML(item.id)}"
@@ -1076,10 +1177,11 @@
             <span class="wa-row-top">
               <span class="wa-row-title">
                 ${escapeHTML(name)}
+                ${item.isPinned ? " 📌" : ""}
               </span>
 
               <span class="wa-row-meta">
-                ${escapeHTML(time)}
+                ${escapeHTML(formatDate(item.lastMessageAt))}
               </span>
             </span>
 
@@ -1090,14 +1192,37 @@
           </span>
         </button>
 
-        <button
-          class="wa-icon-button"
-          type="button"
-          data-wa-chat-menu="${escapeHTML(item.id)}"
-          aria-label="च्याट विकल्प"
-          title="च्याट विकल्प"
-          style="width:34px;height:34px;flex-basis:34px"
-        >⋮</button>
+        <div
+          style="
+            display:flex;
+            flex-direction:column;
+            align-items:center;
+            gap:4px
+          "
+        >
+          ${
+            unread
+              ? `
+                <span
+                  style="
+                    width:9px;
+                    height:9px;
+                    border-radius:50%;
+                    background:var(--wa-accent)
+                  "
+                ></span>
+              `
+              : ""
+          }
+
+          <button
+            class="wa-icon-button"
+            type="button"
+            data-wa-chat-menu="${escapeHTML(item.id)}"
+            aria-label="च्याट विकल्प"
+            style="width:34px;height:34px;flex-basis:34px"
+          >⋮</button>
+        </div>
       </div>
     `;
   }
@@ -1175,6 +1300,7 @@
     resultData(response, null);
 
     await refreshConversations();
+
     closeDialog();
 
     showToast("Chat preference सुरक्षित भयो।", "success");
@@ -1247,6 +1373,14 @@
       );
     }
 
+    const friendIds = new Set(
+      (state.friends.friends || []).map(item => item.id)
+    );
+
+    const outgoingIds = new Set(
+      (state.friends.outgoing || []).map(item => item.person?.id)
+    );
+
     return `
       <div class="wa-list" style="margin-top:12px">
         ${results.map(person => `
@@ -1259,13 +1393,25 @@
               </span>
             </span>
 
-            <button
-              class="wa-button wa-button-primary"
-              type="button"
-              data-wa-add-friend="${escapeHTML(person.id)}"
-            >
-              Add
-            </button>
+            ${
+              friendIds.has(person.id)
+                ? `
+                  <button
+                    class="wa-button wa-button-primary"
+                    type="button"
+                    data-wa-open-friend-chat="${escapeHTML(person.id)}"
+                  >Message</button>
+                `
+                : outgoingIds.has(person.id)
+                  ? `<span class="wa-row-preview">Pending</span>`
+                  : `
+                    <button
+                      class="wa-button wa-button-primary"
+                      type="button"
+                      data-wa-add-friend="${escapeHTML(person.id)}"
+                    >Add</button>
+                  `
+            }
           </div>
         `).join("")}
       </div>
@@ -1291,6 +1437,14 @@
     if (container) {
       container.innerHTML = renderFriendSearchResults();
     }
+
+    const pageContainer = root.querySelector(
+      "[data-wa-contact-page-results]"
+    );
+
+    if (pageContainer) {
+      pageContainer.innerHTML = renderFriendSearchResults();
+    }
   }
 
   async function sendFriendRequest(userId) {
@@ -1305,8 +1459,14 @@
 
     showToast("Friend Request पठाइयो।", "success");
 
-    if (state.page === "contacts") {
-      renderContacts();
+    if (state.page === "contacts") renderContacts();
+
+    const container = root.querySelector(
+      "[data-wa-contact-results]"
+    );
+
+    if (container) {
+      container.innerHTML = renderFriendSearchResults();
     }
   }
 
@@ -1329,9 +1489,9 @@
      GROUPS
   ===================================================== */
 
-  function renderCommunities() {
+  function renderGroups() {
     const page = root.querySelector(
-      '[data-wa-page-content="communities"]'
+      '[data-wa-page-content="groups"]'
     );
 
     if (!page) return;
@@ -1472,6 +1632,172 @@
     }
   }
 
+  function openGroupInfo(conversation) {
+    const members = conversation.members || [];
+    const isAdmin = conversation.role === "admin";
+
+    const friends = state.friends.friends || [];
+
+    const existing = new Set(
+      members.map(member => member.id)
+    );
+
+    const available = friends.filter(
+      person => !existing.has(person.id)
+    );
+
+    showDialog(
+      conversation.name || "Group info",
+      `
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:18px">
+          ${avatarHTML(conversation.name, conversation.avatar, "is-large")}
+
+          <div>
+            <strong>${escapeHTML(conversation.name)}</strong>
+            <p class="wa-row-preview">
+              ${members.length} members
+            </p>
+          </div>
+        </div>
+
+        <h3 class="wa-section-title">Members</h3>
+
+        <div class="wa-list">
+          ${members.map(member => `
+            <div class="wa-list-row">
+              ${avatarHTML(member.name, member.avatar, "is-small")}
+
+              <span class="wa-row-main">
+                <strong>${escapeHTML(member.name)}</strong>
+                <span class="wa-row-preview">
+                  ${escapeHTML(member.role || "member")}
+                  ${member.id === currentUserId() ? " · You" : ""}
+                </span>
+              </span>
+
+              ${
+                isAdmin &&
+                member.id !== currentUserId()
+                  ? `
+                    <button
+                      class="wa-icon-button"
+                      type="button"
+                      data-wa-group-remove="${escapeHTML(member.id)}"
+                      data-wa-group-id="${escapeHTML(conversation.id)}"
+                      aria-label="Remove member"
+                    >×</button>
+                  `
+                  : ""
+              }
+            </div>
+          `).join("")}
+        </div>
+
+        ${
+          isAdmin && available.length
+            ? `
+              <form data-wa-group-add style="margin-top:16px">
+                <input
+                  type="hidden"
+                  name="conversationId"
+                  value="${escapeHTML(conversation.id)}"
+                >
+
+                <label class="wa-section-title">
+                  Add friend
+                </label>
+
+                <select
+                  name="memberId"
+                  required
+                  style="
+                    width:100%;
+                    padding:12px;
+                    border:1px solid var(--wa-border);
+                    border-radius:10px;
+                    background:var(--wa-surface);
+                    color:var(--wa-text)
+                  "
+                >
+                  <option value="">साथी छान्नुहोस्</option>
+                  ${available.map(person => `
+                    <option value="${escapeHTML(person.id)}">
+                      ${escapeHTML(person.name)}
+                    </option>
+                  `).join("")}
+                </select>
+
+                <button
+                  class="wa-button wa-button-primary"
+                  type="submit"
+                  style="width:100%;margin-top:10px"
+                >
+                  Add member
+                </button>
+              </form>
+            `
+            : ""
+        }
+      `
+    );
+  }
+
+  async function addGroupMember(form) {
+    const data = new FormData(form);
+
+    const conversationId = String(
+      data.get("conversationId") || ""
+    );
+
+    const memberId = String(data.get("memberId") || "");
+
+    if (!conversationId || !memberId) {
+      throw new Error("सदस्य छान्नुहोस्।");
+    }
+
+    const response = await service("messages")
+      .manageGroupMember(
+        conversationId,
+        "add",
+        memberId
+      );
+
+    resultData(response, null);
+
+    await refreshConversations();
+
+    const conversation = findConversation(conversationId);
+
+    closeDialog();
+
+    if (conversation) openGroupInfo(conversation);
+
+    showToast("सदस्य थपियो।", "success");
+  }
+
+  async function removeGroupMember(conversationId, memberId) {
+    if (!global.confirm("यो सदस्यलाई समूहबाट हटाउने?")) return;
+
+    const response = await service("messages")
+      .manageGroupMember(
+        conversationId,
+        "remove",
+        memberId
+      );
+
+    resultData(response, null);
+
+    await refreshConversations();
+
+    const conversation = findConversation(conversationId);
+
+    closeDialog();
+
+    if (conversation) openGroupInfo(conversation);
+
+    showToast("सदस्य हटाइयो।", "success");
+  }
+
   /* =====================================================
      CHAT DETAIL
   ===================================================== */
@@ -1484,10 +1810,18 @@
       return;
     }
 
+    const requestVersion = ++state.chatRequestVersion;
+
+    await service("messages").stopPresence?.();
+
     state.activeChat = conversation;
     state.page = "chat-detail";
     state.messages = [];
     state.replyTo = null;
+    state.hasOlderMessages = true;
+    state.loadingOlder = false;
+    state.typingUsers.clear();
+    state.presenceUsers = [];
 
     root.querySelectorAll("[data-wa-page-content]")
       .forEach(section => {
@@ -1502,34 +1836,43 @@
     page.hidden = false;
     page.classList.add("is-active");
 
+    root.querySelector(".wa-tabs")?.setAttribute("hidden", "");
+    root.querySelector(".wa-bottom-nav")?.setAttribute("hidden", "");
+
     renderChatDetail();
 
     try {
       const response = await service("messages")
         .getMessages(conversationId, { limit: 60 });
 
+      if (requestVersion !== state.chatRequestVersion) return;
+
       const messages = resultData(response);
 
       if (state.activeChat?.id !== conversationId) return;
 
-      // Service returns oldest-to-newest. Do not reverse.
       state.messages = messages;
+      state.hasOlderMessages = messages.length >= 60;
 
       await hydrateMessageMedia(state.messages);
 
+      if (requestVersion !== state.chatRequestVersion) return;
+
       renderChatDetail();
 
-      await service("messages").markRead(conversationId);
+      const readResponse = await service("messages")
+        .markRead(conversationId);
 
-      service("messages").startPresence(conversationId);
+      if (readResponse?.ok) {
+        await refreshConversations();
+      }
+
+      await service("messages").startPresence(conversationId);
 
       scrollMessageList();
 
     } catch (error) {
-      showToast(
-        error.message || "सन्देश लोड गर्न सकिएन।",
-        "error"
-      );
+      showError(error, "सन्देश लोड गर्न सकिएन।");
     }
   }
 
@@ -1563,6 +1906,12 @@
     if (!page || !conversation) return;
 
     const messages = state.messages || [];
+
+    const statusText = state.typingUsers.size
+      ? "typing..."
+      : conversation.type === "group"
+        ? `${conversation.members?.length || 0} members`
+        : " ";
 
     page.innerHTML = `
       <header class="wa-chat-header wa-header">
@@ -1598,13 +1947,7 @@
           <span
             class="wa-row-preview"
             data-wa-typing-status
-          >
-            ${
-              conversation.type === "group"
-                ? `${conversation.members?.length || 0} members`
-                : "Tap for contact info"
-            }
-          </span>
+          >${escapeHTML(statusText)}</span>
         </button>
 
         <button
@@ -1632,13 +1975,24 @@
           display:flex;
           flex-direction:column;
           gap:8px;
-          background:
-            linear-gradient(
-              var(--wa-bg),
-              var(--wa-bg)
-            )
+          background:var(--wa-bg)
         "
       >
+        ${
+          state.hasOlderMessages && messages.length
+            ? `
+              <button
+                class="wa-button wa-button-quiet"
+                type="button"
+                data-wa-action="load-older"
+                ${state.loadingOlder ? "disabled" : ""}
+              >
+                ${state.loadingOlder ? "लोड हुँदैछ..." : "पुराना सन्देश"}
+              </button>
+            `
+            : ""
+        }
+
         ${
           messages.length
             ? messages.map(renderMessage).join("")
@@ -1664,10 +2018,12 @@
             ? `
               <div style="display:flex;justify-content:space-between;gap:10px">
                 <span>
-                  Replying to: ${escapeHTML(
-                    state.replyTo.content || "Message"
+                  Replying to:
+                  ${escapeHTML(
+                    state.replyTo.content || "Attachment"
                   )}
                 </span>
+
                 <button
                   type="button"
                   data-wa-action="cancel-reply"
@@ -1689,19 +2045,17 @@
           background:var(--wa-surface)
         "
       >
-
         <button
           class="wa-icon-button"
           type="button"
           data-wa-action="attach-file"
           aria-label="फाइल जोड्नुहोस्"
-          title="फाइल जोड्नुहोस्"
         >＋</button>
 
         <input
           type="file"
           data-wa-file-input
-          accept="image/*,video/*,application/pdf,text/plain"
+          accept="image/*,video/*,application/pdf,text/plain,.doc,.docx"
           hidden
         >
 
@@ -1731,9 +2085,14 @@
           aria-label="सन्देश पठाउनुहोस्"
           style="min-width:44px;padding:8px 13px"
         >➤</button>
-
       </form>
     `;
+
+    const list = page.querySelector("[data-wa-message-list]");
+
+    if (list && messages.length) {
+      list.scrollTop = list.scrollHeight;
+    }
   }
 
   function renderMessage(message) {
@@ -1798,8 +2157,10 @@
       }
     }
 
-    const reply = message.replyToId
-      ? `<small style="display:block;color:var(--wa-text-muted)">↪ Reply</small>`
+    const receipt = mine
+      ? message.receipts?.length
+        ? "✓✓"
+        : "✓"
       : "";
 
     return `
@@ -1828,8 +2189,11 @@
             overflow-wrap:anywhere
           "
         >
-
-          ${reply}
+          ${
+            message.replyToId
+              ? `<small style="display:block;color:var(--wa-text-muted)">↪ Reply</small>`
+              : ""
+          }
 
           ${media}
 
@@ -1856,44 +2220,46 @@
           >
             ${message.editedAt ? "Edited · " : ""}
             ${escapeHTML(formatTime(message.createdAt))}
-
-            ${mine ? (message.receipts?.length ? "✓✓" : "✓") : ""}
+            <span>${receipt}</span>
           </div>
 
-          <div style="display:flex;gap:5px;margin-top:5px">
-            <button
-              type="button"
-              data-wa-reply-message="${escapeHTML(message.id)}"
-              title="Reply"
-              style="border:0;background:transparent;color:var(--wa-text-secondary);font-size:11px"
-            >↩ Reply</button>
-
-            ${
-              mine && !deleted && message.type === "text"
-                ? `
+          ${
+            !deleted
+              ? `
+                <div style="display:flex;gap:5px;margin-top:5px">
                   <button
                     type="button"
-                    data-wa-edit-message="${escapeHTML(message.id)}"
+                    data-wa-reply-message="${escapeHTML(message.id)}"
                     style="border:0;background:transparent;color:var(--wa-text-secondary);font-size:11px"
-                  >Edit</button>
-                `
-                : ""
-            }
+                  >↩ Reply</button>
 
-            ${
-              mine && !deleted
-                ? `
-                  <button
-                    type="button"
-                    data-wa-delete-message="${escapeHTML(message.id)}"
-                    style="border:0;background:transparent;color:var(--wa-danger);font-size:11px"
-                  >Delete</button>
-                `
-                : ""
-            }
+                  ${
+                    mine && message.type === "text"
+                      ? `
+                        <button
+                          type="button"
+                          data-wa-edit-message="${escapeHTML(message.id)}"
+                          style="border:0;background:transparent;color:var(--wa-text-secondary);font-size:11px"
+                        >Edit</button>
+                      `
+                      : ""
+                  }
 
-          </div>
-
+                  ${
+                    mine
+                      ? `
+                        <button
+                          type="button"
+                          data-wa-delete-message="${escapeHTML(message.id)}"
+                          style="border:0;background:transparent;color:var(--wa-danger);font-size:11px"
+                        >Delete</button>
+                      `
+                      : ""
+                  }
+                </div>
+              `
+              : ""
+          }
         </article>
       </div>
     `;
@@ -1906,6 +2272,78 @@
       list.scrollTop = list.scrollHeight;
     }
   }
+
+  async function loadOlderMessages() {
+    if (
+      !state.activeChat ||
+      state.loadingOlder ||
+      !state.messages.length ||
+      !state.hasOlderMessages
+    ) {
+      return;
+    }
+
+    state.loadingOlder = true;
+
+    const conversationId = state.activeChat.id;
+    const first = state.messages[0];
+
+    const cursor = {
+      id: first.id,
+      createdAt: first.createdAt
+    };
+
+    const list = root.querySelector("[data-wa-message-list]");
+    const oldHeight = list?.scrollHeight || 0;
+
+    renderChatDetail();
+
+    try {
+      const response = await service("messages")
+        .getOlderMessages(
+          conversationId,
+          cursor,
+          60
+        );
+
+      const older = resultData(response);
+
+      if (state.activeChat?.id !== conversationId) return;
+
+      await hydrateMessageMedia(older);
+
+      const known = new Set(
+        state.messages.map(item => item.id)
+      );
+
+      state.messages = [
+        ...older.filter(item => !known.has(item.id)),
+        ...state.messages
+      ];
+
+      state.hasOlderMessages = older.length >= 60;
+
+      state.loadingOlder = false;
+
+      renderChatDetail();
+
+      const nextList = root.querySelector("[data-wa-message-list]");
+
+      if (nextList) {
+        nextList.scrollTop =
+          nextList.scrollHeight - oldHeight;
+      }
+
+    } catch (error) {
+      state.loadingOlder = false;
+      renderChatDetail();
+      showError(error, "पुराना सन्देश लोड गर्न सकिएन।");
+    }
+  }
+
+  /* =====================================================
+     SEND, REPLY, EDIT, DELETE AND MEDIA
+  ===================================================== */
 
   async function sendMessage(form) {
     const conversation = state.activeChat;
@@ -1922,7 +2360,11 @@
 
     if (!text) return;
 
-    input.disabled = true;
+    const button = form.querySelector(
+      'button[type="submit"]'
+    );
+
+    setButtonLoading(button, true, "…");
 
     try {
       const response = state.replyTo
@@ -1939,11 +2381,14 @@
       const message = resultData(response, null);
 
       if (message) {
-        state.messages.push(message);
+        const exists = state.messages.some(
+          item => item.id === message.id
+        );
+
+        if (!exists) state.messages.push(message);
       }
 
       state.replyTo = null;
-
       input.value = "";
 
       await service("messages").sendTyping(
@@ -1957,8 +2402,8 @@
       await refreshConversations();
 
     } finally {
-      input.disabled = false;
-      input.focus();
+      setButtonLoading(button, false);
+      input?.focus();
     }
   }
 
@@ -1972,7 +2417,6 @@
 
     if (message) {
       state.messages.push(message);
-
       await hydrateMessageMedia([message]);
     }
 
@@ -1985,9 +2429,7 @@
   }
 
   async function replyToMessage(messageId) {
-    const message = state.messages.find(
-      item => String(item.id) === String(messageId)
-    );
+    const message = findMessage(messageId);
 
     if (!message) return;
 
@@ -1999,9 +2441,7 @@
   }
 
   async function editMessage(messageId) {
-    const message = state.messages.find(
-      item => String(item.id) === String(messageId)
-    );
+    const message = findMessage(messageId);
 
     if (!message || message.senderId !== currentUserId()) return;
 
@@ -2055,7 +2495,11 @@
     const response = await service("messages")
       .getMessages(conversationId, { limit: 60 });
 
-    state.messages = resultData(response);
+    const messages = resultData(response);
+
+    if (state.activeChat?.id !== conversationId) return;
+
+    state.messages = messages;
 
     await hydrateMessageMedia(state.messages);
 
@@ -2080,6 +2524,8 @@
       return;
     }
 
+    state.messageSearch = term.trim();
+
     const response = await service("messages")
       .searchMessages(state.activeChat.id, term, 50);
 
@@ -2091,16 +2537,20 @@
         ? `
           <div class="wa-list">
             ${results.map(message => `
-              <div class="wa-list-row">
-                <div class="wa-row-main">
+              <button
+                class="wa-list-row"
+                type="button"
+                data-wa-jump-message="${escapeHTML(message.id)}"
+              >
+                <span class="wa-row-main">
                   <strong>
                     ${escapeHTML(message.content || message.text || "Attachment")}
                   </strong>
                   <span class="wa-row-preview">
                     ${escapeHTML(formatDate(message.createdAt))}
                   </span>
-                </div>
-              </div>
+                </span>
+              </button>
             `).join("")}
           </div>
         `
@@ -2304,6 +2754,8 @@
 
   /* =====================================================
      UPDATES
+     Existing posts table is used. This is not a
+     24-hour WhatsApp Status implementation.
   ===================================================== */
 
   function renderUpdates() {
@@ -2320,7 +2772,7 @@
         <div>
           <h2 class="wa-page-title">Updates</h2>
           <p class="wa-page-description">
-            नयाँ पोस्ट र गतिविधिहरू
+            साझा गरिएका पोस्ट र गतिविधिहरू
           </p>
         </div>
 
@@ -2698,7 +3150,6 @@
             </button>
           </div>
         </div>
-
       </section>
 
       <section class="wa-section">
@@ -2722,9 +3173,7 @@
       `
         <form data-wa-update-profile>
 
-          <label class="wa-section-title">
-            Name
-          </label>
+          <label class="wa-section-title">Name</label>
 
           <input
             name="name"
@@ -2742,13 +3191,11 @@
             "
           >
 
-          <label class="wa-section-title">
-            About
-          </label>
+          <label class="wa-section-title">About</label>
 
           <textarea
             name="bio"
-            maxlength="500"
+            maxlength="240"
             rows="3"
             style="
               width:100%;
@@ -2761,13 +3208,11 @@
             "
           >${escapeHTML(profile.bio || "")}</textarea>
 
-          <label class="wa-section-title">
-            Location
-          </label>
+          <label class="wa-section-title">Location</label>
 
           <input
             name="location"
-            maxlength="120"
+            maxlength="100"
             value="${escapeHTML(profile.location || "")}"
             style="
               width:100%;
@@ -2780,9 +3225,7 @@
             "
           >
 
-          <label class="wa-section-title">
-            Avatar URL
-          </label>
+          <label class="wa-section-title">Avatar URL</label>
 
           <input
             name="avatarUrl"
@@ -3061,6 +3504,7 @@
                   <strong>
                     ${escapeHTML(conversation?.name || "Chat")}
                   </strong>
+
                   <span class="wa-row-preview">
                     ${escapeHTML(message.content || message.text || "Attachment")}
                   </span>
@@ -3082,11 +3526,9 @@
   ===================================================== */
 
   function bindEvents() {
-    if (!root || root.dataset.waEventsBound === "true") {
-      return;
-    }
+    if (!root || eventsBound) return;
 
-    root.dataset.waEventsBound = "true";
+    eventsBound = true;
 
     root.addEventListener("click", handleClick);
     root.addEventListener("submit", handleSubmit);
@@ -3102,196 +3544,260 @@
 
     if (!target) return;
 
-    if (target.matches("[data-wa-close-dialog]")) {
-      if (event.target === target) closeDialog();
-      return;
-    }
+    try {
+      if (target.matches("[data-wa-close-dialog]")) {
+        if (event.target === target) closeDialog();
+        return;
+      }
 
-    if (target.dataset.waPage) {
-      navigate(target.dataset.waPage);
-      return;
-    }
+      if (target.dataset.waPage) {
+        navigate(target.dataset.waPage);
+        return;
+      }
 
-    if (target.dataset.waOpenChat) {
-      closeDialog();
-      await openChat(target.dataset.waOpenChat);
-      return;
-    }
+      if (target.dataset.waOpenChat) {
+        closeDialog();
+        await openChat(target.dataset.waOpenChat);
+        return;
+      }
 
-    if (target.dataset.waOpenFriendChat) {
-      await openFriendChat(target.dataset.waOpenFriendChat);
-      return;
-    }
+      if (target.dataset.waOpenFriendChat) {
+        await openFriendChat(target.dataset.waOpenFriendChat);
+        return;
+      }
 
-    if (target.dataset.waChatFilter) {
-      state.chatFilter = target.dataset.waChatFilter;
-      renderChats();
-      return;
-    }
+      if (target.dataset.waChatInfo) {
+        const conversation = findConversation(
+          target.dataset.waChatInfo
+        );
 
-    if (target.dataset.waChatMenu) {
-      showChatMenu(target.dataset.waChatMenu);
-      return;
-    }
+        if (conversation?.type === "group") {
+          openGroupInfo(conversation);
+        } else if (conversation) {
+          showDialog(
+            conversation.name,
+            `
+              <div style="text-align:center;padding:20px">
+                ${avatarHTML(
+                  conversation.name,
+                  conversation.avatar,
+                  "is-large"
+                )}
 
-    if (target.dataset.waChatPreference) {
-      await updateChatPreference(
-        target.dataset.waChatId,
-        target.dataset.waChatPreference
-      );
-      return;
-    }
-
-    if (target.dataset.waAddFriend) {
-      await sendFriendRequest(target.dataset.waAddFriend);
-      return;
-    }
-
-    if (target.dataset.waFriendAction) {
-      await handleFriendAction(
-        target.dataset.waFriendAction,
-        target.dataset.waRequestId
-      );
-      return;
-    }
-
-    if (target.dataset.waReplyMessage) {
-      await replyToMessage(target.dataset.waReplyMessage);
-      return;
-    }
-
-    if (target.dataset.waEditMessage) {
-      await editMessage(target.dataset.waEditMessage);
-      return;
-    }
-
-    if (target.dataset.waDeleteMessage) {
-      await deleteMessage(target.dataset.waDeleteMessage);
-      return;
-    }
-
-    if (target.dataset.waEditPost) {
-      await editPost(target.dataset.waEditPost);
-      return;
-    }
-
-    if (target.dataset.waDeletePost) {
-      await deletePost(target.dataset.waDeletePost);
-      return;
-    }
-
-    if (target.dataset.waNotification) {
-      await markNotificationRead(target.dataset.waNotification);
-      return;
-    }
-
-    if (target.dataset.waDeleteNotification) {
-      await deleteNotification(
-        target.dataset.waDeleteNotification
-      );
-      return;
-    }
-
-    if (target.dataset.waSearchResult) {
-      closeDialog();
-      await openChat(target.dataset.waSearchResult);
-      return;
-    }
-
-    if (target.dataset.waTheme) {
-      setTheme(target.dataset.waTheme);
-      return;
-    }
-
-    if (target.dataset.waAction) {
-      switch (target.dataset.waAction) {
-        case "new-chat":
-          openNewChat();
-          break;
-
-        case "create-group":
-          renderCreateGroupDialog();
-          break;
-
-        case "create-post":
-          renderCreatePostDialog();
-          break;
-
-        case "refresh-updates":
-          await refreshUpdates();
-          break;
-
-        case "notifications":
-          navigate("notifications");
-          break;
-
-        case "profile":
-          navigate("profile");
-          break;
-
-        case "edit-profile":
-          renderEditProfileDialog();
-          break;
-
-        case "global-search":
-          openGlobalSearch();
-          break;
-
-        case "chat-search":
-          await searchCurrentChat();
-          break;
-
-        case "back-to-chats":
-          navigate("chats");
-          break;
-
-        case "attach-file":
-          root.querySelector("[data-wa-file-input]")?.click();
-          break;
-
-        case "cancel-reply":
-          state.replyTo = null;
-          renderChatDetail();
-          break;
-
-        case "mark-all-read":
-          await markAllNotificationsRead();
-          break;
-
-        case "signout":
-          await signOut();
-          break;
-
-        case "signup":
-          await handleSignup();
-          break;
-
-        case "forgot-password":
-          await handleForgotPassword();
-          break;
-
-        case "close-dialog":
-          closeDialog();
-          break;
-
-        case "toggle-disclosure": {
-          const disclosure = target.closest(".wa-disclosure");
-
-          if (disclosure) {
-            const expanded =
-              disclosure.getAttribute("aria-expanded") === "true";
-
-            disclosure.setAttribute(
-              "aria-expanded",
-              expanded ? "false" : "true"
-            );
-          }
-          break;
+                <h3>${escapeHTML(conversation.name)}</h3>
+                <p class="wa-row-preview">Personal chat</p>
+              </div>
+            `
+          );
         }
 
-        default:
-          break;
+        return;
       }
+
+      if (target.dataset.waChatFilter) {
+        state.chatFilter = target.dataset.waChatFilter;
+        renderChats();
+        return;
+      }
+
+      if (target.dataset.waChatMenu) {
+        showChatMenu(target.dataset.waChatMenu);
+        return;
+      }
+
+      if (target.dataset.waChatPreference) {
+        await updateChatPreference(
+          target.dataset.waChatId,
+          target.dataset.waChatPreference
+        );
+        return;
+      }
+
+      if (target.dataset.waAddFriend) {
+        await sendFriendRequest(target.dataset.waAddFriend);
+        return;
+      }
+
+      if (target.dataset.waFriendAction) {
+        await handleFriendAction(
+          target.dataset.waFriendAction,
+          target.dataset.waRequestId
+        );
+        return;
+      }
+
+      if (target.dataset.waGroupRemove) {
+        await removeGroupMember(
+          target.dataset.waGroupId,
+          target.dataset.waGroupRemove
+        );
+        return;
+      }
+
+      if (target.dataset.waReplyMessage) {
+        await replyToMessage(target.dataset.waReplyMessage);
+        return;
+      }
+
+      if (target.dataset.waEditMessage) {
+        await editMessage(target.dataset.waEditMessage);
+        return;
+      }
+
+      if (target.dataset.waDeleteMessage) {
+        await deleteMessage(target.dataset.waDeleteMessage);
+        return;
+      }
+
+      if (target.dataset.waEditPost) {
+        await editPost(target.dataset.waEditPost);
+        return;
+      }
+
+      if (target.dataset.waDeletePost) {
+        await deletePost(target.dataset.waDeletePost);
+        return;
+      }
+
+      if (target.dataset.waNotification) {
+        await markNotificationRead(target.dataset.waNotification);
+        return;
+      }
+
+      if (target.dataset.waDeleteNotification) {
+        await deleteNotification(
+          target.dataset.waDeleteNotification
+        );
+        return;
+      }
+
+      if (target.dataset.waSearchResult) {
+        closeDialog();
+        await openChat(target.dataset.waSearchResult);
+        return;
+      }
+
+      if (target.dataset.waJumpMessage) {
+        const id = target.dataset.waJumpMessage;
+        closeDialog();
+
+        const message = findMessage(id);
+
+        if (message) {
+          root.querySelector(
+            `[data-wa-message="${CSS.escape(id)}"]`
+          )?.scrollIntoView({ behavior: "smooth", block: "center" });
+        } else {
+          showToast(
+            "यो सन्देश हालको लोड गरिएको इतिहासमा छैन।",
+            "info"
+          );
+        }
+
+        return;
+      }
+
+      if (target.dataset.waTheme) {
+        setTheme(target.dataset.waTheme);
+        return;
+      }
+
+      if (target.dataset.waAction) {
+        switch (target.dataset.waAction) {
+          case "new-chat":
+            openNewChat();
+            break;
+
+          case "create-group":
+            renderCreateGroupDialog();
+            break;
+
+          case "create-post":
+            renderCreatePostDialog();
+            break;
+
+          case "refresh-updates":
+            await refreshUpdates();
+            break;
+
+          case "notifications":
+            navigate("notifications");
+            break;
+
+          case "profile":
+            navigate("profile");
+            break;
+
+          case "edit-profile":
+            renderEditProfileDialog();
+            break;
+
+          case "global-search":
+            openGlobalSearch();
+            break;
+
+          case "chat-search":
+            await searchCurrentChat();
+            break;
+
+          case "back-to-chats":
+            navigate("chats");
+            break;
+
+          case "attach-file":
+            root.querySelector("[data-wa-file-input]")?.click();
+            break;
+
+          case "cancel-reply":
+            state.replyTo = null;
+            renderChatDetail();
+            break;
+
+          case "mark-all-read":
+            await markAllNotificationsRead();
+            break;
+
+          case "load-older":
+            await loadOlderMessages();
+            break;
+
+          case "signout":
+            await signOut();
+            break;
+
+          case "signup":
+            await handleSignup();
+            break;
+
+          case "forgot-password":
+            await handleForgotPassword();
+            break;
+
+          case "close-dialog":
+            closeDialog();
+            break;
+
+          case "toggle-disclosure": {
+            const disclosure = target.closest(".wa-disclosure");
+
+            if (disclosure) {
+              const expanded =
+                disclosure.getAttribute("aria-expanded") === "true";
+
+              disclosure.setAttribute(
+                "aria-expanded",
+                expanded ? "false" : "true"
+              );
+            }
+            break;
+          }
+
+          default:
+            break;
+        }
+      }
+    } catch (error) {
+      showError(error);
     }
   }
 
@@ -3312,10 +3818,7 @@
       try {
         await sendMessage(form);
       } catch (error) {
-        showToast(
-          error.message || "सन्देश पठाउन सकिएन।",
-          "error"
-        );
+        showError(error, "सन्देश पठाउन सकिएन।");
       }
       return;
     }
@@ -3327,7 +3830,7 @@
         const data = new FormData(form);
         await searchUsers(data.get("query"));
       } catch (error) {
-        showToast(error.message || "खोज असफल भयो।", "error");
+        showError(error, "खोज असफल भयो।");
       }
       return;
     }
@@ -3338,16 +3841,8 @@
       try {
         const data = new FormData(form);
         await searchUsers(data.get("query"));
-
-        const container = root.querySelector(
-          "[data-wa-contact-page-results]"
-        );
-
-        if (container) {
-          container.innerHTML = renderFriendSearchResults();
-        }
       } catch (error) {
-        showToast(error.message || "खोज असफल भयो।", "error");
+        showError(error, "खोज असफल भयो।");
       }
       return;
     }
@@ -3358,7 +3853,18 @@
       try {
         await createGroup(form);
       } catch (error) {
-        showToast(error.message || "समूह बनाउन सकिएन।", "error");
+        showError(error, "समूह बनाउन सकिएन।");
+      }
+      return;
+    }
+
+    if (form.matches("[data-wa-group-add]")) {
+      event.preventDefault();
+
+      try {
+        await addGroupMember(form);
+      } catch (error) {
+        showError(error, "सदस्य थप्न सकिएन।");
       }
       return;
     }
@@ -3369,7 +3875,7 @@
       try {
         await createPost(form);
       } catch (error) {
-        showToast(error.message || "Update प्रकाशित भएन।", "error");
+        showError(error, "Update प्रकाशित भएन।");
       }
       return;
     }
@@ -3380,7 +3886,7 @@
       try {
         await updateProfile(form);
       } catch (error) {
-        showToast(error.message || "Profile सुरक्षित भएन।", "error");
+        showError(error, "Profile सुरक्षित भएन।");
       }
       return;
     }
@@ -3392,7 +3898,7 @@
         const data = new FormData(form);
         await performGlobalSearch(data.get("query"));
       } catch (error) {
-        showToast(error.message || "खोज असफल भयो।", "error");
+        showError(error, "खोज असफल भयो।");
       }
     }
   }
@@ -3401,29 +3907,46 @@
     const input = event.target;
 
     if (input.matches("[data-wa-chat-search]")) {
+      const cursor = input.selectionStart;
+
       state.chatSearch = input.value;
+
       renderChats();
 
       const next = root.querySelector("[data-wa-chat-search]");
 
       if (next) {
         next.focus();
-        next.setSelectionRange(
-          next.value.length,
-          next.value.length
-        );
+
+        try {
+          next.setSelectionRange(cursor, cursor);
+        } catch (_) {}
       }
 
       return;
     }
 
     if (input.matches("[data-wa-message-input]")) {
-      if (state.activeChat) {
-        service("messages").sendTyping(
-          state.activeChat.id,
-          Boolean(input.value.trim())
-        );
+      if (!state.activeChat) return;
+
+      const conversationId = state.activeChat.id;
+      const typing = Boolean(input.value.trim());
+
+      service("messages").sendTyping(
+        conversationId,
+        typing
+      );
+
+      if (state.typingTimer) {
+        global.clearTimeout(state.typingTimer);
       }
+
+      state.typingTimer = global.setTimeout(() => {
+        service("messages").sendTyping(
+          conversationId,
+          false
+        );
+      }, 1800);
     }
   }
 
@@ -3438,13 +3961,14 @@
       try {
         await sendAttachment(file);
       } catch (error) {
-        showToast(
-          error.message || "फाइल पठाउन सकिएन।",
-          "error"
-        );
+        showError(error, "फाइल पठाउन सकिएन।");
       }
 
       input.value = "";
+      return;
+    }
+
+    if (input.matches('[data-wa-create-post] input[name="media"]')) {
       return;
     }
   }
@@ -3459,9 +3983,11 @@
 
       const form = event.target.closest("form");
 
-      if (form) {
-        form.requestSubmit();
-      }
+      if (form) form.requestSubmit();
+    }
+
+    if (event.key === "Escape") {
+      closeDialog();
     }
   }
 
@@ -3471,6 +3997,7 @@
 
   async function signOut() {
     try {
+      await service("messages").stopRealtime?.();
       await service("messages").stopPresence?.();
       await service("notifications").stopRealtime?.();
 
@@ -3491,37 +4018,42 @@
       renderAuthScreen();
 
     } catch (error) {
-      showToast(
-        error.message || "Log Out असफल भयो।",
-        "error"
-      );
+      showError(error, "Log Out असफल भयो।");
     }
   }
 
   /* =====================================================
-     REALTIME
+     REALTIME EVENTS
   ===================================================== */
 
   function bindRealtimeEvents() {
-    if (realtimeListenersBound) return;
+    if (realtimeEventsBound) return;
 
-    realtimeListenersBound = true;
+    realtimeEventsBound = true;
 
     global.addEventListener(
       "ksk:messages-cloud-change",
       async event => {
         if (!state.authenticated) return;
 
+        const detail = event.detail || {};
+
+        const message = detail.message || {};
+        const conversationId =
+          detail.conversationId ||
+          message.conversation_id ||
+          message.conversationId ||
+          detail.receipt?.conversation_id ||
+          "";
+
         try {
           await refreshConversations();
-
-          const detail = event.detail || {};
 
           if (
             state.activeChat &&
             (
-              !detail.conversationId ||
-              detail.conversationId === state.activeChat.id
+              !conversationId ||
+              String(conversationId) === String(state.activeChat.id)
             )
           ) {
             await reloadActiveMessages();
@@ -3538,10 +4070,9 @@
     global.addEventListener(
       "ksk:posts-cloud-change",
       async () => {
-        if (
-          state.authenticated &&
-          state.page === "updates"
-        ) {
+        if (!state.authenticated) return;
+
+        if (state.page === "updates") {
           try {
             await refreshUpdates();
           } catch (error) {
@@ -3553,20 +4084,31 @@
 
     global.addEventListener(
       "ksk:notification-cloud-change",
-      async () => {
+      async event => {
         if (!state.authenticated) return;
 
-        try {
-          const response = await service("notifications")
-            .getNotifications({ limit: 80 });
+        const detail = event.detail || {};
 
-          state.notifications = resultData(response);
+        if (detail.action === "add" && detail.item) {
+          const exists = state.notifications.some(
+            item => item.id === detail.item.id
+          );
+
+          if (!exists) {
+            state.notifications.unshift(detail.item);
+          }
 
           updateNotificationCount();
 
           if (state.page === "notifications") {
             renderNotifications();
           }
+
+          return;
+        }
+
+        try {
+          await refreshNotifications();
         } catch (error) {
           console.warn("Notification realtime:", error);
         }
@@ -3587,6 +4129,39 @@
     );
 
     global.addEventListener(
+      "ksk:typing-change",
+      event => {
+        const detail = event.detail || {};
+
+        if (
+          !state.activeChat ||
+          String(detail.conversationId) !==
+            String(state.activeChat.id)
+        ) {
+          return;
+        }
+
+        if (detail.typing) {
+          state.typingUsers.add(detail.userId);
+        } else {
+          state.typingUsers.delete(detail.userId);
+        }
+
+        const status = root.querySelector(
+          "[data-wa-typing-status]"
+        );
+
+        if (status) {
+          status.textContent = state.typingUsers.size
+            ? "typing..."
+            : state.activeChat.type === "group"
+              ? `${state.activeChat.members?.length || 0} members`
+              : " ";
+        }
+      }
+    );
+
+    global.addEventListener(
       "ksk:auth-change",
       event => {
         const user = event.detail?.user || null;
@@ -3597,6 +4172,9 @@
         if (!state.authenticated) {
           state.initialized = false;
           state.activeChat = null;
+          state.conversations = [];
+          state.messages = [];
+
           renderAuthScreen();
         } else if (!state.initialized) {
           startApplication();
@@ -3604,24 +4182,57 @@
       }
     );
 
-    global.addEventListener(
-      "ksk:typing-change",
-      event => {
-        const detail = event.detail || {};
+    global.addEventListener("online", () => {
+      state.realtime.online = true;
 
-        if (
-          !state.activeChat ||
-          detail.conversationId !== state.activeChat.id
-        ) {
-          return;
+      if (state.authenticated) {
+        service("messages").startRealtime?.();
+        service("messages").updateLastSeen?.();
+
+        loadDashboard().catch(error => {
+          console.warn("Reconnect refresh:", error);
+        });
+      }
+    });
+
+    global.addEventListener("offline", () => {
+      state.realtime.online = false;
+
+      if (state.authenticated) {
+        showToast(
+          "इन्टरनेट जडान छैन। पुनः जडानको प्रतीक्षामा...",
+          "error"
+        );
+      }
+    });
+
+    global.addEventListener("ksk:messages-cloud-change", event => {
+      const detail = event.detail || {};
+
+      if (detail.action === "realtime-connected") {
+        state.realtime.messages = true;
+      }
+
+      if (detail.action === "realtime-error") {
+        state.realtime.messages = false;
+      }
+    });
+
+    global.addEventListener(
+      "ksk:notification-cloud-change",
+      event => {
+        const status = event.detail?.status;
+
+        if (status === "SUBSCRIBED") {
+          state.realtime.notifications = true;
         }
 
-        const status = root.querySelector(
-          "[data-wa-typing-status]"
-        );
-
-        if (status && detail.typing) {
-          status.textContent = "typing...";
+        if (
+          status === "CHANNEL_ERROR" ||
+          status === "TIMED_OUT" ||
+          status === "CLOSED"
+        ) {
+          state.realtime.notifications = false;
         }
       }
     );
@@ -3664,11 +4275,37 @@
           service("profile").initialize()
         ];
 
-        await Promise.allSettled(initializers);
+        const initResults = await Promise.allSettled(
+          initializers
+        );
+
+        const failed = initResults
+          .map((result, index) => ({
+            result,
+            name: [
+              "Messages",
+              "Contacts",
+              "Updates",
+              "Notifications",
+              "Profile"
+            ][index]
+          }))
+          .filter(item =>
+            item.result.status === "rejected" ||
+            item.result.value?.ok === false
+          )
+          .map(item => item.name);
 
         await loadDashboard();
 
         state.initialized = true;
+
+        if (failed.length) {
+          showToast(
+            "केही सेवा सुरु भएनन्: " + failed.join(", "),
+            "error"
+          );
+        }
 
         return true;
 
@@ -3692,12 +4329,19 @@
                 class="wa-button wa-button-primary"
                 type="button"
                 data-wa-action="retry"
-                onclick="location.reload()"
               >
                 पुनः प्रयास
               </button>
             </div>
           `;
+
+          const retry = root.querySelector(
+            '[data-wa-action="retry"]'
+          );
+
+          retry?.addEventListener("click", () => {
+            global.location.reload();
+          });
         }
 
         return false;
@@ -3760,11 +4404,14 @@
     getState() {
       return {
         initialized: state.initialized,
+        initializing: state.initializing,
         authenticated: state.authenticated,
         page: state.page,
         activeChat: state.activeChat,
         conversationCount: state.conversations.length,
-        friendCount: state.friends.friends.length
+        friendCount: state.friends.friends.length,
+        unreadCount: state.conversations.filter(isUnread).length,
+        realtime: { ...state.realtime }
       };
     },
 
