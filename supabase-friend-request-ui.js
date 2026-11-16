@@ -1,308 +1,498 @@
 
 "use strict";
 
-(function (global) {
-  if (global.KSKFriendRequestUI) return;
+/*
+ * MERO SANSAR — FRIEND REQUEST UI PATCH
+ *
+ * Features:
+ * 1. Add Cancel button to outgoing friend requests.
+ * 2. Cancel only the current user's pending request.
+ * 3. Refresh app data after successful cancellation.
+ * 4. Hide legacy post_comment and post_reaction notifications.
+ * 5. Preserve all existing Supabase notification methods.
+ *
+ * Load this file AFTER supabase-notifications.js
+ * and BEFORE app.js.
+ */
 
-  const ROOT = "[data-wa-root]";
-  const OPEN_ATTR = "data-ksk-open-notification";
-  const CANCEL_ATTR = "data-ksk-cancel-request";
+(function (global) {
+  "use strict";
+
+  if (global.__KSK_FRIEND_REQUEST_UI_LOADED__) return;
+  global.__KSK_FRIEND_REQUEST_UI_LOADED__ = true;
+
+  const LEGACY_NOTIFICATION_TYPES = new Set([
+    "post_comment",
+    "post_reaction"
+  ]);
+
+  const CANCEL_SELECTOR = "[data-ksk-cancel-request]";
 
   let observer = null;
-  let busy = new Set();
   let syncRunning = false;
+  let syncRequested = false;
+  let lastContactsPage = null;
 
-  const $ = (selector, parent = document) =>
-    parent.querySelector(selector);
+  /* =====================================================
+     HELPERS
+  ===================================================== */
 
-  function app() {
-    return global.KSKWhatsAppApp || null;
-  }
-
-  function friends() {
+  function getFriendsAPI() {
     return global.KSKSupabaseFriends || null;
   }
 
-  function notifications() {
+  function getNotificationsAPI() {
     return global.KSKSupabaseNotifications || null;
   }
 
-  function root() {
-    return $(ROOT);
+  function getAppAPI() {
+    return global.KSKWhatsAppApp || null;
   }
 
-  function notify(message, type = "info") {
-    global.dispatchEvent(new CustomEvent("ksk:toast", {
-      detail: { message, type }
-    }));
-    console.info("[FriendRequestUI]", message);
+  function isElement(value) {
+    return value instanceof Element;
   }
 
-  function addButton(row, attribute, id, label, className) {
-    if (!row || !id) return;
+  function getResultData(response) {
+    if (!response || response.ok !== true) {
+      throw new Error(
+        response?.message ||
+        "अनुरोध पूरा हुन सकेन।"
+      );
+    }
 
-    const existing = row.querySelector(`[${attribute}]`);
-    if (existing) {
-      existing.dataset.requestId = id;
+    return response.data;
+  }
+
+  function showMessage(message, type = "info") {
+    try {
+      if (typeof global.showToast === "function") {
+        global.showToast(message, type);
+        return;
+      }
+
+      global.dispatchEvent(
+        new CustomEvent("ksk:friend-request-ui-message", {
+          detail: { message, type }
+        })
+      );
+    } catch (error) {
+      console.warn(
+        "Friend request UI message failed:",
+        error
+      );
+    }
+  }
+
+  /* =====================================================
+     LEGACY NOTIFICATION FILTER
+  ===================================================== */
+
+  function installLegacyNotificationFilter() {
+    const api = getNotificationsAPI();
+
+    if (
+      !api ||
+      typeof api.getNotifications !== "function" ||
+      api.__kskLegacyFilterInstalled
+    ) {
       return;
     }
 
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = className;
-    button.textContent = label;
-    button.setAttribute(attribute, "");
-    button.dataset.requestId = id;
-    button.style.flexShrink = "0";
-    button.style.marginInlineStart = "8px";
+    const originalGetNotifications =
+      api.getNotifications.bind(api);
 
-    row.appendChild(button);
+    const wrappedAPI = {
+      ...api,
+
+      __kskLegacyFilterInstalled: true,
+
+      async getNotifications(options = {}) {
+        const response =
+          await originalGetNotifications(options);
+
+        if (
+          !response ||
+          response.ok !== true ||
+          !Array.isArray(response.data)
+        ) {
+          return response;
+        }
+
+        return {
+          ...response,
+
+          data: response.data.filter(item => {
+            const type = String(
+              item?.type || ""
+            ).trim().toLowerCase();
+
+            return !LEGACY_NOTIFICATION_TYPES.has(type);
+          })
+        };
+      }
+    };
+
+    global.KSKSupabaseNotifications =
+      Object.freeze(wrappedAPI);
+
+    console.info(
+      "KSK legacy notification filter installed."
+    );
   }
 
-  async function syncSentRequests() {
-    if (syncRunning) return;
+  /* =====================================================
+     CONTACTS PAGE
+  ===================================================== */
 
-    const page = $( '[data-wa-page-content="contacts"]', root() || document );
-    if (!page) return;
+  function getContactsPage() {
+    return global.document.querySelector(
+      '[data-wa-page-content="contacts"]'
+    );
+  }
 
-    const heading = [...page.querySelectorAll("h3")]
-      .find(node => /sent requests/i.test(node.textContent || ""));
+  function getSentRequestsSection(page) {
+    if (!page) return null;
 
-    if (!heading) return;
+    const sections = page.querySelectorAll(
+      ".wa-section"
+    );
 
-    const section = heading.closest(".wa-section");
-    if (!section) return;
+    for (const section of sections) {
+      const heading = section.querySelector(
+        ".wa-section-title"
+      );
 
-    const rows = [...section.querySelectorAll(".wa-list-row")];
-    if (!rows.length || rows.every(row => row.querySelector(`[${CANCEL_ATTR}]`))) {
+      if (!heading) continue;
+
+      if (
+        /sent requests/i.test(
+          heading.textContent || ""
+        )
+      ) {
+        return section;
+      }
+    }
+
+    return null;
+  }
+
+  function createCancelButton(requestId) {
+    const button = global.document.createElement(
+      "button"
+    );
+
+    button.type = "button";
+    button.className =
+      "wa-button wa-button-quiet";
+
+    button.textContent = "Cancel";
+
+    button.setAttribute(
+      "data-ksk-cancel-request",
+      requestId
+    );
+
+    button.setAttribute(
+      "aria-label",
+      "Cancel friend request"
+    );
+
+    button.style.whiteSpace = "nowrap";
+    button.style.minHeight = "34px";
+    button.style.flexShrink = "0";
+
+    return button;
+  }
+
+  async function addCancelButtons() {
+    const page = getContactsPage();
+
+    if (!page) {
+      lastContactsPage = null;
+      return;
+    }
+
+    const section = getSentRequestsSection(page);
+
+    if (!section) {
+      lastContactsPage = page;
+      return;
+    }
+
+    const rows = Array.from(
+      section.querySelectorAll(".wa-list-row")
+    );
+
+    if (!rows.length) return;
+
+    /*
+     * Avoid fetching the dashboard repeatedly
+     * when the same rendered rows are already patched.
+     */
+
+    const needsButtons = rows.some(row =>
+      !row.querySelector(CANCEL_SELECTOR)
+    );
+
+    if (!needsButtons) {
+      lastContactsPage = page;
+      return;
+    }
+
+    const friendsAPI = getFriendsAPI();
+
+    if (
+      !friendsAPI ||
+      typeof friendsAPI.getDashboard !== "function"
+    ) {
+      console.warn(
+        "Friends service is not available."
+      );
+      return;
+    }
+
+    const response =
+      await friendsAPI.getDashboard();
+
+    const dashboard = getResultData(response);
+
+    const outgoing = Array.isArray(dashboard?.outgoing)
+      ? dashboard.outgoing
+      : [];
+
+    /*
+     * renderContacts() creates outgoing rows
+     * using outgoing.map(), preserving this order.
+     */
+
+    rows.forEach((row, index) => {
+      if (row.querySelector(CANCEL_SELECTOR)) {
+        return;
+      }
+
+      const request = outgoing[index];
+
+      if (!request?.id) return;
+
+      row.appendChild(
+        createCancelButton(String(request.id))
+      );
+    });
+
+    lastContactsPage = page;
+  }
+
+  async function synchronizeContacts() {
+    if (syncRunning) {
+      syncRequested = true;
       return;
     }
 
     syncRunning = true;
 
     try {
-      const api = friends();
-      if (!api?.getDashboard) return;
+      do {
+        syncRequested = false;
 
-      const response = await api.getDashboard();
-      if (!response?.ok) {
-        throw new Error(response?.message || "Sent Requests लोड भएन।");
-      }
+        await addCancelButtons();
 
-      const outgoing = response.data?.outgoing || [];
+      } while (syncRequested);
 
-      rows.forEach((row, index) => {
-        const request = outgoing[index];
-        if (!request?.id) return;
-
-        addButton(
-          row,
-          CANCEL_ATTR,
-          request.id,
-          "Cancel",
-          "wa-button wa-button-quiet"
-        );
-      });
     } catch (error) {
-      console.error("Sent request UI:", error);
+      console.error(
+        "Could not add friend request buttons:",
+        error
+      );
+
     } finally {
       syncRunning = false;
     }
   }
 
-  async function syncNotificationButtons() {
-    const page = $( '[data-wa-page-content="notifications"]', root() || document );
-    if (!page) return;
-
-    const rows = [...page.querySelectorAll(".wa-list-row")];
-    const missing = rows.filter(row =>
-      row.querySelector("[data-wa-delete-notification]") &&
-      !row.querySelector(`[${OPEN_ATTR}]`)
-    );
-
-    if (!missing.length) return;
-
-    missing.forEach(row => {
-      const del = row.querySelector("[data-wa-delete-notification]");
-      const id = del?.dataset.waDeleteNotification;
-      if (!id) return;
-
-      addButton(
-        row,
-        OPEN_ATTR,
-        id,
-        "खोल्नुहोस्",
-        "wa-button wa-button-quiet"
-      );
-    });
-  }
+  /* =====================================================
+     CANCEL FRIEND REQUEST
+  ===================================================== */
 
   async function cancelRequest(button) {
-    const id = button.dataset.requestId;
-    if (!id || busy.has(id)) return;
+    const requestId = String(
+      button.getAttribute(
+        "data-ksk-cancel-request"
+      ) || ""
+    ).trim();
 
-    busy.add(id);
-    button.disabled = true;
-    button.textContent = "रद्द हुँदै…";
-
-    try {
-      const api = friends();
-      if (!api?.cancelFriendRequest) {
-        throw new Error("Cancel Request सेवा उपलब्ध छैन।");
-      }
-
-      const response = await api.cancelFriendRequest(id);
-      if (!response?.ok) {
-        throw new Error(response?.message || "Request रद्द भएन।");
-      }
-
-      const application = app();
-      if (application?.refresh) {
-        await application.refresh();
-      }
-
-      notify("Friend Request रद्द भयो।", "success");
-    } catch (error) {
-      console.error("Cancel request failed:", error);
-      button.disabled = false;
-      button.textContent = "फेरि प्रयास";
-      button.title = error?.message || "रद्द गर्न सकिएन।";
-    } finally {
-      busy.delete(id);
+    if (!requestId) {
+      showMessage(
+        "Friend Request ID भेटिएन।",
+        "error"
+      );
+      return;
     }
-  }
 
-  async function openNotification(button) {
-    const id = button.dataset.requestId;
-    if (!id || busy.has(id)) return;
+    const friendsAPI = getFriendsAPI();
 
-    busy.add(id);
+    if (
+      !friendsAPI ||
+      typeof friendsAPI.cancelFriendRequest !== "function"
+    ) {
+      showMessage(
+        "Friend Request सेवा उपलब्ध छैन।",
+        "error"
+      );
+      return;
+    }
+
+    if (button.disabled) return;
+
+    const previousText = button.textContent;
+
     button.disabled = true;
-    button.textContent = "खोल्दै…";
+    button.textContent = "Cancelling…";
 
     try {
-      const api = notifications();
-      const application = app();
+      const response =
+        await friendsAPI.cancelFriendRequest(
+          requestId
+        );
 
-      if (!api?.getNotifications || !application) {
-        throw new Error("Notification सेवा उपलब्ध छैन।");
-      }
+      getResultData(response);
 
-      const response = await api.getNotifications({ limit: 100 });
-      if (!response?.ok) {
-        throw new Error(response?.message || "Notification लोड भएन।");
-      }
-
-      const item = (response.data || []).find(
-        entry => String(entry.id) === String(id)
+      showMessage(
+        "Friend Request Cancel भयो।",
+        "success"
       );
 
-      if (!item) {
-        throw new Error("Notification भेटिएन।");
-      }
-
-      if (!item.read && api.markAsRead) {
-        const marked = await api.markAsRead(id);
-        if (!marked?.ok) {
-          throw new Error(marked?.message || "Notification पढिएको चिन्ह लगाउन सकिएन।");
-        }
-      }
+      const app = getAppAPI();
 
       if (
-        item.entityType === "friend_request" ||
-        item.type === "friend_request" ||
-        item.type === "friend_accepted"
+        app &&
+        typeof app.refresh === "function"
       ) {
-        application.navigate("contacts");
+        await app.refresh();
       } else if (
-        item.entityType === "conversation" &&
-        item.entityId
+        typeof friendsAPI.getDashboard === "function"
       ) {
-        await application.refresh();
-        await application.openChat(item.entityId);
-      } else {
-        application.navigate("notifications");
+        await synchronizeContacts();
       }
+
     } catch (error) {
-      console.error("Open notification failed:", error);
+      console.error(
+        "Cancel friend request failed:",
+        error
+      );
+
+      showMessage(
+        error?.message ||
+        "Friend Request Cancel गर्न सकिएन।",
+        "error"
+      );
+
       button.disabled = false;
-      button.textContent = "फेरि प्रयास";
-      button.title = error?.message || "Notification खोल्न सकिएन।";
-    } finally {
-      busy.delete(id);
+      button.textContent = previousText;
     }
   }
 
+  /* =====================================================
+     EVENT HANDLING
+  ===================================================== */
+
   function bindEvents() {
-    document.addEventListener("click", event => {
-      const target = event.target instanceof Element
-        ? event.target
-        : null;
+    global.document.addEventListener(
+      "click",
+      async event => {
+        if (!isElement(event.target)) return;
 
-      if (!target) return;
+        const button = event.target.closest(
+          CANCEL_SELECTOR
+        );
 
-      const cancel = target.closest(`[${CANCEL_ATTR}]`);
-      if (cancel) {
+        if (!button) return;
+
+        /*
+         * Prevent the main app click handler
+         * from processing this button.
+         */
+
         event.preventDefault();
         event.stopPropagation();
         event.stopImmediatePropagation();
-        cancelRequest(cancel);
+
+        await cancelRequest(button);
+
+      },
+      true
+    );
+  }
+
+  /* =====================================================
+     DOM OBSERVER
+  ===================================================== */
+
+  function startObserver() {
+    const root =
+      global.document.querySelector(
+        "[data-wa-root]"
+      ) ||
+      global.document.getElementById("waApp");
+
+    if (!root || observer) return;
+
+    observer = new MutationObserver(() => {
+      const page = getContactsPage();
+
+      if (page !== lastContactsPage) {
+        synchronizeContacts();
         return;
       }
 
-      const open = target.closest(`[${OPEN_ATTR}]`);
-      if (open) {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation();
-        openNotification(open);
+      const section =
+        getSentRequestsSection(page);
+
+      if (!section) return;
+
+      const rows = section.querySelectorAll(
+        ".wa-list-row"
+      );
+
+      const missingButton = Array.from(rows).some(
+        row => !row.querySelector(CANCEL_SELECTOR)
+      );
+
+      if (missingButton) {
+        synchronizeContacts();
       }
-    }, true);
-  }
-
-  function enhance() {
-    syncSentRequests();
-    syncNotificationButtons();
-  }
-
-  function initialize() {
-    const element = root();
-    if (!element || observer) return;
-
-    bindEvents();
-    enhance();
-
-    observer = new MutationObserver(records => {
-      const relevant = records.some(record => {
-        const target = record.target instanceof Element
-          ? record.target
-          : record.target.parentElement;
-
-        return target?.closest(
-          '[data-wa-page-content="contacts"],' +
-          '[data-wa-page-content="notifications"]'
-        );
-      });
-
-      if (relevant) enhance();
     });
 
-    observer.observe(element, {
+    observer.observe(root, {
       childList: true,
       subtree: true
     });
 
-    console.info("Mero Sansar Friend Request UI loaded.");
+    synchronizeContacts();
   }
 
-  global.KSKFriendRequestUI = Object.freeze({
-    initialize,
-    refresh: enhance
-  });
+  /* =====================================================
+     INITIALIZATION
+  ===================================================== */
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", initialize, { once: true });
+  function initialize() {
+    installLegacyNotificationFilter();
+    bindEvents();
+    startObserver();
+
+    console.info(
+      "KSK Friend Request UI initialized."
+    );
+  }
+
+  if (global.document.readyState === "loading") {
+    global.document.addEventListener(
+      "DOMContentLoaded",
+      initialize,
+      { once: true }
+    );
   } else {
     initialize();
   }
+
 })(window);
