@@ -46,13 +46,19 @@
     }
   </style>
 
+  <!-- Supabase services -->
   <script defer src="./supabase-auth.js"></script>
   <script defer src="./supabase-profile.js"></script>
   <script defer src="./supabase-friends.js"></script>
   <script defer src="./supabase-messages.js"></script>
   <script defer src="./supabase-posts.js"></script>
   <script defer src="./supabase-notifications.js"></script>
+
+  <!-- Main application -->
   <script defer src="./app.js"></script>
+
+  <!-- Navigation controller must load after app.js -->
+  <script defer src="./app-navigation.js"></script>
 </head>
 
 <body>
