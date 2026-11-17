@@ -7,10 +7,9 @@
   <meta name="theme-color" content="#075e54">
   <meta name="description" content="Mero Sansar — निजी कुराकानी, समूह र अपडेटहरू।">
   <meta name="color-scheme" content="light">
-
   <title>Mero Sansar</title>
 
-  <link rel="stylesheet" href="./design-system.css?v=20261117-2">
+  <link rel="stylesheet" href="./design-system.css?v=20261117-3">
 
   <style>
     html, body {
@@ -20,57 +19,24 @@
       background: #f7f8fa;
     }
 
-    body {
+    body, #waApp {
       min-height: 100dvh;
     }
 
-    #waApp {
-      min-height: 100dvh;
-    }
-
-    #waStartupFallback {
-      min-height: 100dvh;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-      box-sizing: border-box;
-      color: #667781;
-      font-family: system-ui, sans-serif;
-      text-align: center;
-    }
-
-    #waStartupFallback[hidden] {
+    #waLoaderError {
       display: none;
-    }
-
-    [data-ksk-cancel-request],
-    [data-ksk-open-notification] {
-      white-space: nowrap;
-      min-height: 34px;
+      padding: 24px;
+      color: #b42318;
+      font: 15px system-ui, sans-serif;
+      text-align: center;
     }
   </style>
 
-  <!-- Supabase services -->
-  <script defer src="./supabase-auth.js?v=20261117-2"></script>
-  <script defer src="./supabase-profile.js?v=20261117-2"></script>
-  <script defer src="./supabase-friends.js?v=20261117-2"></script>
-  <script defer src="./supabase-messages.js?v=20261117-2"></script>
-  <script defer src="./supabase-posts.js?v=20261117-2"></script>
-  <script defer src="./supabase-notifications.js?v=20261117-2"></script>
-
-  <!-- Friend requests -->
-  <script defer src="./supabase-friend-request-ui.js?v=20261117-2"></script>
-
-  <!-- Chat reliability -->
-  <script defer src="./supabase-chat-reliability.js?v=20261117-2"></script>
-
-  <!-- Main WhatsApp-style application -->
-  <script defer src="./app.js?v=20261117-2"></script>
-  <script defer src="./app-navigation.js?v=20261117-2"></script>
+  <script defer src="./app-loader.js?v=20261117-3"></script>
 </head>
-
 <body>
   <div id="waApp" data-wa-root></div>
+  <div id="waLoaderError" role="alert"></div>
 
   <noscript>
     <main style="padding:24px;font-family:system-ui">
