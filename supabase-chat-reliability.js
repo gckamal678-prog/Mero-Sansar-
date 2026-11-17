@@ -4,25 +4,32 @@
 /*
  * MERO SANSAR — CHAT RELIABILITY LAYER
  *
- * Load order:
- * supabase-auth.js
- * supabase-messages.js
- * supabase-chat-reliability.js
- * app.js
+ * FIX:
+ * Do not Proxy Object.freeze(KSKSupabaseMessages).
+ * A frozen object's non-writable methods cannot be
+ * replaced through a Proxy get trap.
  *
- * Direct message permission is enforced by Supabase RLS.
- * Client-side friendship pre-check is intentionally removed
- * from sendMessage to prevent false blocking.
+ * Use Object.create(original) and own method overrides.
+ *
+ * Rules:
+ * - Accepted friendship required for direct chat creation.
+ * - Message sending goes directly to original service.
+ * - Supabase RLS remains the final permission authority.
+ * - Read receipts and delivered receipts are preserved.
  */
 
 (function (global) {
+  "use strict";
+
   if (global.KSKChatReliabilityLoaded) return;
 
   const original = global.KSKSupabaseMessages;
   const auth = global.KSKSupabaseAuth;
 
   if (!original || !auth) {
-    console.error("Chat Reliability: required services missing.");
+    console.error(
+      "Chat Reliability: required services missing."
+    );
     return;
   }
 
@@ -33,7 +40,7 @@
       ok: false,
       code,
       data: null,
-      message
+      message: message || "अनुरोध पूरा हुन सकेन।"
     };
   }
 
@@ -52,6 +59,14 @@
     }
 
     return { client, user };
+  }
+
+  function errorMessage(error) {
+    return String(
+      error?.message ||
+      error?.details ||
+      "अनुरोध पूरा हुन सकेन।"
+    );
   }
 
   function isRlsError(message) {
@@ -80,14 +95,16 @@
   }
 
   /*
-   * Direct Chat creation:
-   * Only accepted friends can create a direct chat.
+   * DIRECT CHAT
+   * Only accepted friends can create a direct conversation.
    */
   async function createDirectChat(friendId) {
     try {
       const { client, user } = await getContext();
 
-      if (!friendId || friendId === user.id) {
+      const id = String(friendId || "").trim();
+
+      if (!id || id === user.id) {
         return failure(
           "INVALID_FRIEND",
           "मान्य साथी छान्नुहोस्।"
@@ -97,7 +114,7 @@
       const friends = await hasFriendship(
         client,
         user.id,
-        friendId
+        id
       );
 
       if (!friends) {
@@ -107,63 +124,101 @@
         );
       }
 
-      return await original.createDirectChat(friendId);
+      return await original.createDirectChat(id);
 
     } catch (error) {
       console.error("Direct Chat:", error);
 
       return failure(
         "DIRECT_CHAT_FAILED",
-        error.message || "Direct Chat बनाउन सकिएन।"
+        errorMessage(error)
       );
     }
   }
 
   /*
-   * Send Message:
+   * SEND MESSAGE
    *
    * IMPORTANT:
-   * Do not perform extra client-side conversation,
-   * member or friendship queries before sending.
-   *
-   * The original Supabase message service performs
-   * the INSERT. Supabase RLS remains the final authority
-   * and blocks messages when friendship is not accepted.
+   * No extra client-side friendship or membership query.
+   * Original service performs the actual INSERT.
+   * Supabase RLS validates permission.
    */
-  async function sendMessage(conversationId, content, options) {
+  async function sendMessage(
+    conversationId,
+    content,
+    options = {}
+  ) {
     try {
+      const id = String(conversationId || "").trim();
+      const text = String(content || "").trim();
+
+      if (!id) {
+        return failure(
+          "CONVERSATION_REQUIRED",
+          "पहिले कुराकानी छान्नुहोस्।"
+        );
+      }
+
+      if (!text) {
+        return failure(
+          "MESSAGE_EMPTY",
+          "सन्देश लेख्नुहोस्।"
+        );
+      }
+
+      console.info("[Mero Sansar] Sending message:", {
+        conversationId: id,
+        length: text.length
+      });
+
       const response = await original.sendMessage(
-        conversationId,
-        content,
+        id,
+        text,
         options || {}
       );
 
-      if (!response?.ok && isRlsError(response?.message)) {
-        return failure(
-          "MESSAGE_NOT_ALLOWED",
-          "सन्देश पठाउन अनुमति भएन। पहिले साथी बनेको र Chat सदस्यता जाँच गर्नुहोस्।"
+      if (!response?.ok) {
+        console.error(
+          "[Mero Sansar] Message send failed:",
+          response?.code,
+          response?.message
+        );
+
+        if (isRlsError(response?.message)) {
+          return failure(
+            "MESSAGE_NOT_ALLOWED",
+            "सन्देश पठाउन अनुमति भएन। साथीपन र Chat सदस्यता जाँच गर्नुहोस्।"
+          );
+        }
+
+        return response || failure(
+          "MESSAGE_SEND_FAILED",
+          "सन्देश पठाउन सकिएन।"
         );
       }
+
+      console.info(
+        "[Mero Sansar] Message sent successfully:",
+        response.data?.id
+      );
 
       return response;
 
     } catch (error) {
-      console.error("Send Message:", error);
+      console.error("[Mero Sansar] Send Message:", error);
 
       return failure(
         "MESSAGE_SEND_FAILED",
-        error.message || "सन्देश पठाउन सकिएन।"
+        errorMessage(error)
       );
     }
   }
 
   /*
-   * Load message history with actual read receipts.
-   *
-   * Only READ receipts are exposed through receipts.
-   * Delivery-only receipts remain in deliveryReceipts.
+   * LOAD MESSAGES + RECEIPTS
    */
-  async function getMessages(conversationId, options) {
+  async function getMessages(conversationId, options = {}) {
     const response = await original.getMessages(
       conversationId,
       options || {}
@@ -174,7 +229,6 @@
     }
 
     const messages = response.data;
-
     const ids = messages
       .map(message => message.id)
       .filter(Boolean);
@@ -212,25 +266,28 @@
 
         message.deliveryReceipts = all;
 
-        message.receipts = all.filter(
-          receipt =>
-            receipt.userId !== user.id &&
-            Boolean(receipt.readAt)
+        message.receipts = all.filter(receipt =>
+          receipt.userId !== user.id &&
+          Boolean(receipt.readAt)
         );
       });
 
     } catch (error) {
-      console.warn("Read Receipt loading:", error);
+      console.warn(
+        "Read Receipt loading:",
+        error
+      );
     }
 
     return response;
   }
 
   /*
-   * Mark an incoming realtime message as delivered.
+   * INCOMING REALTIME MESSAGE
+   * Mark incoming messages as delivered.
    */
   async function handleIncomingMessage(event) {
-    const detail = event.detail || {};
+    const detail = event?.detail || {};
 
     if (detail.action !== "realtime-message") return;
     if (detail.eventType !== "INSERT") return;
@@ -247,13 +304,15 @@
 
       deliveredMessages.add(message.id);
 
-      const response = await original.markDelivered(message.id);
+      const response = await original.markDelivered(
+        message.id
+      );
 
       if (!response?.ok) {
         deliveredMessages.delete(message.id);
 
         console.warn(
-          "Message delivery receipt failed:",
+          "Delivery receipt failed:",
           response?.message
         );
       }
@@ -274,30 +333,46 @@
   );
 
   /*
-   * Wrap the existing service.
+   * SERVICE FACADE
+   *
+   * Original service is frozen.
+   * Object.create allows safe own method overrides
+   * without violating Proxy invariants.
+   *
+   * All other original service methods remain available
+   * through the prototype.
    */
-  global.KSKSupabaseMessages = new Proxy(original, {
-    get(target, property) {
-      if (property === "createDirectChat") {
-        return createDirectChat;
-      }
+  const facade = Object.create(original);
 
-      if (property === "sendMessage") {
-        return sendMessage;
-      }
+  Object.defineProperties(facade, {
+    createDirectChat: {
+      value: createDirectChat,
+      enumerable: true,
+      configurable: false,
+      writable: false
+    },
 
-      if (property === "getMessages") {
-        return getMessages;
-      }
+    sendMessage: {
+      value: sendMessage,
+      enumerable: true,
+      configurable: false,
+      writable: false
+    },
 
-      return Reflect.get(target, property, target);
+    getMessages: {
+      value: getMessages,
+      enumerable: true,
+      configurable: false,
+      writable: false
     }
   });
+
+  global.KSKSupabaseMessages = facade;
 
   global.KSKChatReliabilityLoaded = true;
 
   console.info(
-    "Mero Sansar Chat Reliability loaded."
+    "Mero Sansar Chat Reliability loaded — Service Facade active."
   );
 
 })(window);
